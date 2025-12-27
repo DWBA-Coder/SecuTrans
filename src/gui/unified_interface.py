@@ -1048,12 +1048,26 @@ class UnifiedInterface:
                 
                 self.send_progress.set_progress(30)
                 
+                # 获取文件元数据
+                original_filename = os.path.basename(self.selected_file)
+                file_extension = os.path.splitext(original_filename)[1]
+                file_size = len(file_data)
+                
                 # 创建数字信封（新方案：包含数字签名）
                 digital_envelope = CryptoUtils.create_digital_envelope(
                     file_data, algorithm, mode, symmetric_key, 
                     self.recipient_public_key, self.private_key, hash_algorithm
                 )
                 
+                # 扩展传输协议：添加文件元数据
+                digital_envelope['file_metadata'] = {
+                    'original_filename': original_filename,
+                    'file_extension': file_extension,
+                    'file_size': file_size,
+                    'timestamp': int(time.time())
+                }
+                
+                self.add_log(f"文件信息: {original_filename} ({file_size} bytes)", "INFO")
                 self.send_progress.set_progress(60)
                 self.add_log("数字信封创建完成（包含数字签名）", "SUCCESS")
                 
@@ -1228,11 +1242,23 @@ class UnifiedInterface:
             self.receive_progress.set_progress(100)
             self.add_log("文件接收处理完成", "SUCCESS")
             
-            # 生成保存文件名
+            # 生成保存文件名（保持原有命名规则）
             algorithm = digital_envelope['algorithm']
             mode = digital_envelope['mode']
             timestamp = int(time.time())
-            filename = f"received_{algorithm}_{mode}_{timestamp}.dat"
+            
+            # 获取原始文件扩展名
+            if 'file_metadata' in digital_envelope:
+                file_extension = digital_envelope['file_metadata'].get('file_extension', '.dat')
+                if not file_extension:  # 如果扩展名为空
+                    file_extension = '.dat'
+                self.add_log(f"检测到文件扩展名: {file_extension}", "INFO")
+            else:
+                file_extension = '.dat'
+                self.add_log("未检测到文件扩展名，使用默认 .dat", "WARNING")
+            
+            # 按照原有规则命名：received_{算法}_{模式}_{时间戳}{扩展名}
+            filename = f"received_{algorithm}_{mode}_{timestamp}{file_extension}"
             save_path = os.path.join(self.save_path_var.get(), filename)
             
             # 确保保存目录存在
