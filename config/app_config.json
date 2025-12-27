@@ -1,0 +1,14 @@
+{
+    "private_key_path": "keys/SecuTrans_20251227_182052_private.pem",
+    "public_certificate_path": "D:/Users/mh191/PycharmProjects/SecuTrans/certificates/SecuTrans_20251227_172342_public.pem",
+    "receive_directory": "files/",
+    "server_port": "5375",
+    "last_algorithm": "AES-128",
+    "last_mode": "GCM",
+    "auto_generate_key_info": {
+        "name": "SecuTrans",
+        "email": "user@sectrans.com",
+        "organization": "SecuTrans Team",
+        "country": "CN"
+    }
+}
