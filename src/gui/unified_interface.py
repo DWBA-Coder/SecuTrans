@@ -39,7 +39,7 @@ class UnifiedInterface:
         
         # TLS/SSL选项（默认启用）
         self.use_tls = tk.BooleanVar(value=True)
-        self.network_utils = NetworkUtils(use_tls=self.use_tls.get())
+        self.network_utils = NetworkUtils(use_tls=self.use_tls.get(), allow_self_signed=True)
         self.crypto_utils = CryptoUtils()
         
         # 发送方相关
@@ -51,7 +51,10 @@ class UnifiedInterface:
         self.private_key = None
         self.server_running = False
         self.client_socket = None
-        
+
+        # 活动线程管理
+        self._active_threads = []
+
         # 进度条
         self.send_progress = None
         self.receive_progress = None
@@ -642,29 +645,63 @@ class UnifiedInterface:
         pass  # 布局已在_create_widgets中设置
     
     def _load_saved_config(self):
-        """加载保存的配置"""
+        """加载保存的配置（带验证）"""
         try:
-            # 加载密钥路径
+            # 加载密钥路径（验证文件格式）
             private_key_path = app_config.get("private_key_path", "")
             if private_key_path and os.path.exists(private_key_path):
-                self.private_key_var.set(private_key_path)
-                self.private_key = CryptoUtils.load_key_from_file(private_key_path)
-            
+                try:
+                    self.private_key_var.set(private_key_path)
+                    self.private_key = CryptoUtils.load_key_from_file(private_key_path)
+                    self.add_log(f"成功加载私钥配置: {os.path.basename(private_key_path)}", "SUCCESS")
+                except Exception as e:
+                    self.add_log(f"私钥文件格式错误: {str(e)}", "ERROR")
+                    self.private_key_var.set("")
+                    self.private_key = None
+
             cert_path = app_config.get("public_certificate_path", "")
             if cert_path and os.path.exists(cert_path):
-                self.cert_var.set(cert_path)
-                self.recipient_public_key = CryptoUtils.load_key_from_file(cert_path)
-            
-            # 加载保存路径
+                try:
+                    self.cert_var.set(cert_path)
+                    self.recipient_public_key = CryptoUtils.load_key_from_file(cert_path)
+                    self.add_log(f"成功加载证书配置: {os.path.basename(cert_path)}", "SUCCESS")
+                except Exception as e:
+                    self.add_log(f"证书文件格式错误: {str(e)}", "ERROR")
+                    self.cert_var.set("")
+                    self.recipient_public_key = None
+
+            # 加载保存路径（验证目录可访问性）
             save_dir = app_config.get("receive_directory", "files/")
-            self.save_path_var.set(save_dir)
-            
-            # 加载端口设置
-            self.receive_port_var.set(app_config.get("server_port", "5375"))
-            
+            if os.path.isdir(save_dir):
+                try:
+                    self.save_path_var.set(save_dir)
+                    # 测试目录可写性
+                    test_file = os.path.join(save_dir, ".write_test")
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    os.remove(test_file)
+                except Exception as e:
+                    self.add_log(f"保存目录不可写: {str(e)}", "WARNING")
+                    self.save_path_var.set("files/")
+            else:
+                self.save_path_var.set("files/")
+
+            # 加载端口设置（验证端口范围）
+            port = app_config.get("server_port", "5375")
+            try:
+                port_num = int(port)
+                if 1 <= port_num <= 65535:
+                    self.receive_port_var.set(port)
+                else:
+                    self.add_log(f"端口超出范围(1-65535): {port_num}", "WARNING")
+                    self.receive_port_var.set("5375")
+            except ValueError:
+                self.add_log(f"端口格式错误: {port}", "WARNING")
+                self.receive_port_var.set("5375")
+
             # 加载加密设置 - 延迟到界面完全创建后执行
             self.root.after(100, self._initialize_crypto_settings)
-            
+
         except Exception as e:
             self.add_log(f"加载配置失败: {str(e)}", "ERROR")
     
@@ -688,7 +725,7 @@ class UnifiedInterface:
             app_config.set("receive_directory", self.save_path_var.get())
             app_config.set("server_port", self.receive_port_var.get())
             app_config.set_last_crypto_settings(self.algorithm_var.get(), self.mode_var.get())
-            
+
             # 保存密钥生成信息
             app_config.set_auto_generate_info({
                 'name': self.key_name_var.get(),
@@ -698,25 +735,135 @@ class UnifiedInterface:
             })
         except Exception as e:
             self.add_log(f"保存配置失败: {str(e)}", "ERROR")
+
+    # ==================== 线程安全的UI更新方法 ====================
+
+    def _safe_update_ui(self, callback):
+        """
+        在主线程中安全更新UI
+
+        Args:
+            callback: 在主线程中执行的回调函数
+        """
+        try:
+            self.root.after(0, callback)
+        except Exception as e:
+            self.logger.error(f"更新UI失败: {str(e)}")
+
+    def _safe_update_connection_status(self, status: str):
+        """
+        线程安全地更新连接状态
+
+        Args:
+            status: 状态字符串
+        """
+        self._safe_update_ui(lambda: self.client_info_var.set(status))
+
+    def _safe_update_server_status(self, status: str):
+        """
+        线程安全地更新服务器状态
+
+        Args:
+            status: 状态字符串
+        """
+        self._safe_update_ui(lambda: self.server_status_var.set(status))
+
+    def _safe_update_progress(self, progress_type: str, value: int):
+        """
+        线程安全地更新进度条
+
+        Args:
+            progress_type: 'send' 或 'receive'
+            value: 进度值 (0-100)
+        """
+        def update():
+            if progress_type == 'send' and self.send_progress:
+                self.send_progress.set_progress(value)
+            elif progress_type == 'receive' and self.receive_progress:
+                self.receive_progress.set_progress(value)
+
+        self._safe_update_ui(update)
+
+    def _safe_add_log(self, message: str, level: str = 'INFO'):
+        """
+        线程安全地添加日志
+
+        Args:
+            message: 日志消息
+            level: 日志级别
+        """
+        def add_log_ui():
+            timestamp = str(datetime.now().strftime("%H:%M:%S"))
+            self.log_text.insert(tk.END, f"[{timestamp}] ", 'INFO')
+            self.log_text.insert(tk.END, f"{message}\n", level)
+            self.log_text.see(tk.END)
+
+        self._safe_update_ui(add_log_ui)
+
+        # 同时输出到命令行
+        if level == 'ERROR':
+            self.logger.error(message)
+        elif level == 'WARNING':
+            self.logger.warning(message)
+        elif level == 'SUCCESS':
+            self.logger.info(f"✓ {message}")
+        else:
+            self.logger.debug(message)
+
+    def _safe_show_message(self, title: str, message: str, msg_type: str = 'info'):
+        """
+        线程安全地显示消息框
+
+        Args:
+            title: 标题
+            message: 消息内容
+            msg_type: 'info', 'warning', 'error'
+        """
+        def show():
+            if msg_type == 'info':
+                messagebox.showinfo(title, message)
+            elif msg_type == 'warning':
+                messagebox.showwarning(title, message)
+            elif msg_type == 'error':
+                messagebox.showerror(title, message)
+
+        self._safe_update_ui(show)
     
     def _on_closing(self):
-        """窗口关闭事件"""
+        """窗口关闭事件（线程安全）"""
         try:
-            # 保存配置
+            # 保存配置（快速操作）
             self._save_config()
-            
+
             # 停止服务器
-            if self.server_running:
-                self.network_utils.close_connection()
-                self.server_running = False
-            
-            # 关闭网络连接
-            if self.is_connected:
-                self.network_utils.close_connection()
-            
+            self.server_running = False
+            self.is_connected = False
+
+            # 一次性关闭所有网络连接（避免重复调用）
+            self.network_utils.close_connection()
+
+            # 等待所有活动线程结束（最多等待2秒）
+            self._safe_add_log("正在等待活动线程结束...", "INFO")
+            alive_threads = [t for t in self._active_threads if t.is_alive()]
+            if alive_threads:
+                for thread in alive_threads:
+                    try:
+                        thread.join(timeout=0.5)
+                    except Exception as e:
+                        self.logger.warning(f"等待线程结束时出错: {str(e)}")
+
+            # 检查是否还有未结束的线程
+            remaining_threads = [t for t in self._active_threads if t.is_alive()]
+            if remaining_threads:
+                self._safe_add_log(f"警告: {len(remaining_threads)} 个线程仍在运行", "WARNING")
+            else:
+                self._safe_add_log("所有线程已正常结束", "SUCCESS")
+
             log_operation("应用程序退出", "SUCCESS")
             self.logger.info("应用程序正常退出")
-            self.root.destroy()
+
+            # 延迟销毁窗口，给资源释放一点时间
+            self.root.after(50, self.root.destroy)
         except Exception as e:
             print(f"关闭时出错: {e}")
             self.root.destroy()
@@ -751,7 +898,7 @@ class UnifiedInterface:
     
     def _on_mode_changed(self, event=None):
         """模式选择改变时的处理"""
-        self._update_crypto_display()
+        self._update_mode_security()
     
     def _on_hash_changed(self, event=None):
         """哈希算法选择改变时的处理"""
@@ -784,8 +931,8 @@ class UnifiedInterface:
             self.add_log("警告: TLS/SSL加密传输已禁用！网络通信不加密", "WARNING")
         
         # 重新初始化网络工具
-        self.network_utils = NetworkUtils(use_tls=enabled)
-        self.add_log(f"网络工具已更新 (TLS: {'启用' if enabled else '禁用'})", "INFO")
+        self.network_utils = NetworkUtils(use_tls=enabled, allow_self_signed=True)
+        self._safe_add_log(f"网络工具已更新 (TLS: {'启用' if enabled else '禁用'})", "INFO")
     
     def _initialize_crypto_settings(self):
         """初始化加密设置"""
@@ -834,12 +981,32 @@ class UnifiedInterface:
     def _update_mode_security(self):
         """更新模式安全状态"""
         mode = self.mode_var.get()
+        
+        # 根据加密模式显示相应的安全提示
         if mode == 'ECB':
+            # ECB模式不安全：相同的明文块会产生相同的密文块，不保证数据完整性
             self.mode_security_label.config(text="不安全！仅作演示", fg='red')
         elif mode == 'GCM':
-            self.mode_security_label.config(text="认证加密", fg='green')
+            # GCM是认证加密模式，提供机密性、完整性和真实性
+            self.mode_security_label.config(text="认证加密 (推荐)", fg='green')
         elif mode == 'CBC + HMAC-SM3':
+            # 国密SM4的CBC模式配合SM3哈希的认证模式
             self.mode_security_label.config(text="国密认证模式", fg='green')
+        elif mode == 'CBC':
+            # CBC模式需要适当的IV（初始化向量），相对安全但需要额外完整性保护
+            self.mode_security_label.config(text="标准模式", fg='#005FA5')
+        elif mode == 'CTR':
+            # CTR模式将分组密码转换为流密码，可以并行加密
+            self.mode_security_label.config(text="标准模式", fg='#005FA5')
+        elif mode == 'CFB':
+            # CFB模式将分组密码转换为自同步流密码
+            self.mode_security_label.config(text="标准模式", fg='#005FA5')
+        elif mode == 'OFB':
+            # OFB模式将分组密码转换为同步流密码，错误传播受限
+            self.mode_security_label.config(text="标准模式", fg='#005FA5')
+        elif mode == 'Stream':
+            # Stream模式用于流密码（如ChaCha20），安全性良好
+            self.mode_security_label.config(text="流密码 (安全)", fg='green')
         else:
             self.mode_security_label.config(text="")
     
@@ -1036,56 +1203,54 @@ class UnifiedInterface:
         if not self.selected_file:
             messagebox.showerror("错误", "请先选择要发送的文件")
             return
-        
+
         if not self.recipient_public_key:
             messagebox.showerror("错误", "请先导入接收方证书")
             return
-        
+
         if not self.private_key:
             messagebox.showerror("错误", "请先导入自己的私钥（用于数字签名）")
             return
-        
+
         def send_thread():
             try:
-                self.add_log("开始发送文件...", "INFO")
-                
-                # 创建发送进度条
-                if not self.send_progress:
-                    self.send_progress = self._create_progress_bar(self.send_progress_frame)
-                    self.send_progress.pack(fill=tk.X)
-                
+                self._safe_add_log("开始发送文件...", "INFO")
+
+                # 创建发送进度条（使用公共方法）
+                self._ensure_progress_bar('send_progress', self.send_progress_frame)
+
                 # 读取文件
                 with open(self.selected_file, 'rb') as f:
                     file_data = f.read()
-                
-                self.send_progress.set_progress(10)
-                self.add_log("文件读取完成", "SUCCESS")
-                
+
+                self._safe_update_progress('send', 10)
+                self._safe_add_log("文件读取完成", "SUCCESS")
+
                 # 获取加密设置
                 algorithm = self.algorithm_var.get()
                 mode = self.mode_var.get()
                 hash_algorithm = self.hash_var.get()
-                
-                self.add_log(f"使用 {algorithm}-{mode} + {hash_algorithm}", "INFO")
-                
+
+                self._safe_add_log(f"使用 {algorithm}-{mode} + {hash_algorithm}", "INFO")
+
                 # 生成对称密钥
                 key_sizes = ENCRYPTION_ALGORITHMS[algorithm]['key_size']
                 key_size = key_sizes[0]
                 symmetric_key = CryptoUtils.generate_symmetric_key(algorithm, key_size)
-                
-                self.send_progress.set_progress(30)
-                
+
+                self._safe_update_progress('send', 30)
+
                 # 获取文件元数据
                 original_filename = os.path.basename(self.selected_file)
                 file_extension = os.path.splitext(original_filename)[1]
                 file_size = len(file_data)
-                
+
                 # 创建数字信封（新方案：包含数字签名）
                 digital_envelope = CryptoUtils.create_digital_envelope(
-                    file_data, algorithm, mode, symmetric_key, 
+                    file_data, algorithm, mode, symmetric_key,
                     self.recipient_public_key, self.private_key, hash_algorithm
                 )
-                
+
                 # 扩展传输协议：添加文件元数据
                 digital_envelope['file_metadata'] = {
                     'original_filename': original_filename,
@@ -1093,231 +1258,288 @@ class UnifiedInterface:
                     'file_size': file_size,
                     'timestamp': int(time.time())
                 }
-                
-                self.add_log(f"文件信息: {original_filename} ({file_size} bytes)", "INFO")
-                self.send_progress.set_progress(60)
-                self.add_log("数字信封创建完成（包含数字签名）", "SUCCESS")
-                
+
+                self._safe_add_log(f"文件信息: {original_filename} ({file_size} bytes)", "INFO")
+                self._safe_update_progress('send', 60)
+                self._safe_add_log("数字信封创建完成（包含数字签名）", "SUCCESS")
+
                 # 连接接收方
                 host = self.server_ip_var.get()
                 port = int(self.send_port_var.get())
-                
-                self.add_log(f"连接到 {host}:{port}...", "INFO")
+
+                self._safe_add_log(f"连接到 {host}:{port}...", "INFO")
                 if not self.network_utils.connect_to_server(host, port):
                     raise Exception("连接失败")
-                
-                self.add_log(f"连接成功", "SUCCESS")
-                self.send_progress.set_progress(80)
-                
+
+                self._safe_add_log(f"连接成功", "SUCCESS")
+                self._safe_update_progress('send', 80)
+
                 # 发送数据（包含发送方公钥用于验证签名）
                 try:
                     sender_private_key = CryptoUtils.load_key_from_file(self.private_key_var.get())
                     sender_public_key = RSA.import_key(sender_private_key).public_key().export_key()
                 except Exception as e:
                     raise Exception(f"获取发送方公钥失败: {str(e)}")
-                
+
                 if self.network_utils.send_digital_envelope(
                     self.network_utils.client_socket, digital_envelope, sender_public_key
                 ):
-                    self.send_progress.set_progress(100)
-                    self.add_log("文件发送成功", "SUCCESS")
-                    messagebox.showinfo("成功", "文件发送完成！")
+                    self._safe_update_progress('send', 100)
+                    self._safe_add_log("文件发送成功", "SUCCESS")
+                    self._safe_show_message("成功", "文件发送完成！", 'info')
+
+                    # 发送成功后立即关闭客户端连接
+                    try:
+                        self.network_utils._close_client_socket()
+                        self.is_connected = False
+                    except:
+                        pass
                 else:
                     raise Exception("发送失败")
-                
+
             except Exception as e:
-                self.add_log(f"发送失败: {str(e)}", "ERROR")
-                messagebox.showerror("错误", f"发送失败: {str(e)}")
+                self._safe_add_log(f"发送失败: {str(e)}", "ERROR")
+                self._safe_show_message("错误", f"发送失败: {str(e)}", 'error')
                 # 关闭连接
                 try:
-                    self.network_utils.close_connection()
+                    self.network_utils._close_client_socket()
+                    self.is_connected = False
                 except:
                     pass
-        
+            finally:
+                # 从活动线程列表中移除
+                self._active_threads = [t for t in self._active_threads if t.is_alive()]
+
         # 在新线程中执行发送
-        threading.Thread(target=send_thread, daemon=True).start()
+        thread = threading.Thread(target=send_thread, daemon=True)
+        thread.start()
+        self._active_threads.append(thread)
     
     def _start_server(self):
-        """启动服务器"""
+        """启动服务器（线程安全）"""
         if self.server_running:
             messagebox.showinfo("信息", "服务器已在运行")
             return
-        
+
         def start():
             try:
                 port = int(self.receive_port_var.get())
-                
-                self.add_log(f"启动服务器，端口: {port}", "INFO")
-                self.server_status_var.set("正在启动...")
-                
+
+                self._safe_add_log(f"启动服务器，端口: {port}", "INFO")
+                self._safe_update_server_status("正在启动...")
+
                 if self.network_utils.start_server(port, self._on_client_connected):
                     self.server_running = True
-                    self.server_status_var.set(f"服务器运行中 - {self.local_ip_var.get()}:{port}")
-                    self.add_log(f"服务器启动成功", "SUCCESS")
-                    
-                    # 更新按钮状态
-                    self.start_server_btn.config(state=tk.DISABLED)
-                    self.stop_server_btn.config(state=tk.NORMAL)
-                    self.receive_port_entry.config(state=tk.DISABLED)
+
+                    def update_ui():
+                        self.server_status_var.set(f"服务器运行中 - {self.local_ip_var.get()}:{port}")
+                        self.start_server_btn.config(state=tk.DISABLED)
+                        self.stop_server_btn.config(state=tk.NORMAL)
+                        self.receive_port_entry.config(state=tk.DISABLED)
+                    self._safe_update_ui(update_ui)
+
+                    self._safe_add_log(f"服务器启动成功", "SUCCESS")
                 else:
                     raise Exception("服务器启动失败")
-                    
+
             except Exception as e:
-                self.server_status_var.set("服务器启动失败")
-                self.add_log(f"服务器启动失败: {str(e)}", "ERROR")
-                messagebox.showerror("错误", f"服务器启动失败: {str(e)}")
-        
-        threading.Thread(target=start, daemon=True).start()
+                self._safe_update_server_status("服务器启动失败")
+                self._safe_add_log(f"服务器启动失败: {str(e)}", "ERROR")
+                messagebox.showerror("错误", f"服务器启动失败: {str(e)}", 'error')
+
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        self._active_threads.append(thread)
     
     def _stop_server(self):
-        """停止服务器"""
+        """停止服务器（线程安全）"""
         try:
             self.network_utils.close_connection()
             self.server_running = False
             self.client_socket = None
-            
-            self.server_status_var.set("服务器已停止")
-            self.client_info_var.set("等待连接...")
-            self.add_log("服务器已停止", "INFO")
-            
-            # 更新按钮状态
-            self.start_server_btn.config(state=tk.NORMAL)
-            self.stop_server_btn.config(state=tk.DISABLED)
-            self.receive_port_entry.config(state=tk.NORMAL)
-            
+
+            self._safe_update_server_status("服务器已停止")
+            self._safe_update_connection_status("等待连接...")
+            self._safe_add_log("服务器已停止", "INFO")
+
+            # 更新按钮状态（线程安全）
+            def update_buttons():
+                self.start_server_btn.config(state=tk.NORMAL)
+                self.stop_server_btn.config(state=tk.DISABLED)
+                self.receive_port_entry.config(state=tk.NORMAL)
+            self._safe_update_ui(update_buttons)
+
         except Exception as e:
-            self.add_log(f"停止服务器失败: {str(e)}", "ERROR")
+            self._safe_add_log(f"停止服务器失败: {str(e)}", "ERROR")
     
     def _on_client_connected(self, client_socket, address):
-        """客户端连接回调"""
+        """客户端连接回调（线程安全）"""
         self.client_socket = client_socket
         client_ip = address[0]
         client_port = address[1]
-        
-        # 更新接收方界面状态
-        self.client_info_var.set(f"已连接: {client_ip}:{client_port}")
-        self.add_log(f"客户端连接: {client_ip}:{client_port}", "SUCCESS")
-        
-        # 处理接收
-        threading.Thread(target=self._handle_client, args=(client_socket,), daemon=True).start()
+
+        # 线程安全地更新接收方界面状态
+        self._safe_update_connection_status(f"已连接: {client_ip}:{client_port}")
+        self._safe_add_log(f"客户端连接: {client_ip}:{client_port}", "SUCCESS")
+
+        # 处理接收（在独立线程中）
+        thread = threading.Thread(target=self._handle_client, args=(client_socket,), daemon=True)
+        thread.start()
+        self._active_threads.append(thread)
     
     def _handle_client(self, client_socket):
-        """处理客户端连接"""
+        """处理客户端连接（线程安全）"""
         try:
-            # 创建接收进度条
-            if not self.receive_progress:
-                self.receive_progress = self._create_progress_bar(self.receive_progress_frame)
-                self.receive_progress.pack(fill=tk.X)
-            
+            # 创建接收进度条（使用公共方法）
+            self._ensure_progress_bar('receive_progress', self.receive_progress_frame)
+
             # 接收数字信封和发送方公钥
-            self.receive_progress.set_progress(20)
+            self._safe_update_progress('receive', 20)
             digital_envelope, sender_public_key = self.network_utils.receive_digital_envelope(client_socket)
-            
+
             if not digital_envelope:
                 raise Exception("接收失败")
-            
-            self.receive_progress.set_progress(40)
-            self.add_log("接收到数字信封", "SUCCESS")
-            
+
+            self._safe_update_progress('receive', 40)
+            self._safe_add_log("接收到数字信封", "SUCCESS")
+
             if sender_public_key:
-                self.add_log("获取发送方公钥成功", "SUCCESS")
+                self._safe_add_log("获取发送方公钥成功", "SUCCESS")
             else:
-                self.add_log("警告：未获取到发送方公钥，无法验证数字签名", "WARNING")
-            
+                self._safe_add_log("警告：未获取到发送方公钥，无法验证数字签名", "WARNING")
+
             # 检查接收方私钥
             if not self.private_key:
                 raise Exception("未设置接收方私钥，无法解密")
-            
+
             # 解密（新方案：验证数字签名）
-            self.receive_progress.set_progress(60)
-            
+            self._safe_update_progress('receive', 60)
+
             if sender_public_key:
                 decrypted_data = CryptoUtils.open_digital_envelope(
                     digital_envelope, self.private_key, sender_public_key
                 )
-                self.add_log("数字签名验证成功", "SUCCESS")
+                self._safe_add_log("数字签名验证成功", "SUCCESS")
             else:
                 # 如果没有发送方公钥，使用旧的解密方式
-                self.add_log("跳过数字签名验证", "WARNING")
+                self._safe_add_log("跳过数字签名验证", "WARNING")
                 # 回退到旧的方法（仅解密）
                 from Crypto.PublicKey import RSA
-                
+
                 # 1. 用接收方私钥解密得到对称密钥
                 import base64
                 encrypted_key = base64.b64decode(digital_envelope['encrypted_key'])
                 symmetric_key = CryptoUtils.decrypt_with_rsa(encrypted_key, self.private_key)
-                
+
                 # 2. 用对称密钥解密数据
                 algorithm = digital_envelope['algorithm']
                 mode = digital_envelope['mode']
                 encrypted_data = digital_envelope['encrypted_data']
                 decrypted_data = CryptoUtils.decrypt_data(encrypted_data, algorithm, mode, symmetric_key)
-                
-                self.add_log("文件解密完成（未验证签名）", "WARNING")
-            
-            self.receive_progress.set_progress(80)
-            
+
+                self._safe_add_log("文件解密完成（未验证签名）", "WARNING")
+
+            self._safe_update_progress('receive', 80)
+
             # 验证数据完整性（如果有原始哈希）
             if 'original_hash' in digital_envelope:
                 hash_algorithm = digital_envelope.get('hash_algorithm', 'SHA-256')
                 calculated_hash = CryptoUtils.calculate_hash(decrypted_data, hash_algorithm)
                 if calculated_hash == digital_envelope['original_hash']:
-                    self.add_log("数据完整性验证通过", "SUCCESS")
+                    self._safe_add_log("数据完整性验证通过", "SUCCESS")
                 else:
                     raise Exception("数据完整性验证失败！文件可能被篡改。")
-            
-            self.receive_progress.set_progress(100)
-            self.add_log("文件接收处理完成", "SUCCESS")
-            
+
+            self._safe_update_progress('receive', 100)
+            self._safe_add_log("文件接收处理完成", "SUCCESS")
+
             # 生成保存文件名（保持原有命名规则）
             algorithm = digital_envelope['algorithm']
             mode = digital_envelope['mode']
             timestamp = int(time.time())
-            
+
             # 获取原始文件扩展名
             if 'file_metadata' in digital_envelope:
                 file_extension = digital_envelope['file_metadata'].get('file_extension', '.dat')
                 if not file_extension:  # 如果扩展名为空
                     file_extension = '.dat'
-                self.add_log(f"检测到文件扩展名: {file_extension}", "INFO")
+                self._safe_add_log(f"检测到文件扩展名: {file_extension}", "INFO")
             else:
                 file_extension = '.dat'
-                self.add_log("未检测到文件扩展名，使用默认 .dat", "WARNING")
-            
+                self._safe_add_log("未检测到文件扩展名，使用默认 .dat", "WARNING")
+
             # 按照原有规则命名：received_{算法}_{模式}_{时间戳}{扩展名}
             filename = f"received_{algorithm}_{mode}_{timestamp}{file_extension}"
             save_path = os.path.join(self.save_path_var.get(), filename)
-            
+
             # 确保保存目录存在
             os.makedirs(self.save_path_var.get(), exist_ok=True)
-            
+
             # 保存文件
             with open(save_path, 'wb') as f:
                 f.write(decrypted_data)
-            
-            self.add_log(f"文件已保存: {filename}", "SUCCESS")
-            
+
+            self._safe_add_log(f"文件已保存: {filename}", "SUCCESS")
+
             # 显示成功消息
             success_msg = f"文件接收完成！\n\n保存路径: {save_path}"
             if sender_public_key:
                 success_msg += "\n✓ 数字签名已验证"
             else:
                 success_msg += "\n⚠ 数字签名未验证"
-                
-            messagebox.showinfo("成功", success_msg)
-            
-        except Exception as e:
-            self.add_log(f"接收失败: {str(e)}", "ERROR")
-            messagebox.showerror("错误", f"接收失败: {str(e)}")
-            # 重置客户端信息
-            self.client_info_var.set("等待连接...")
-            # 关闭客户端连接
+
+            self._safe_show_message("成功", success_msg, 'info')
+
+            # 接收成功后立即关闭客户端连接
             try:
                 if client_socket:
+                    client_socket.settimeout(0.1)
                     client_socket.close()
             except:
                 pass
+
+        except Exception as e:
+            self._safe_add_log(f"接收失败: {str(e)}", "ERROR")
+            self._safe_show_message("错误", f"接收失败: {str(e)}", 'error')
+            self._safe_update_connection_status("等待连接...")
+            # 关闭客户端连接
+            try:
+                if client_socket:
+                    client_socket.settimeout(0.1)
+                    client_socket.close()
+            except:
+                pass
+
+        finally:
+            # 从活动线程列表中移除
+            self._active_threads = [t for t in self._active_threads if t.is_alive()]
     
+    def _ensure_progress_bar(self, progress_var_name, parent_frame):
+        """
+        确保进度条存在（线程安全）
+
+        Args:
+            progress_var_name: 进度条变量名 ('send_progress' 或 'receive_progress')
+            parent_frame: 父容器
+
+        Returns:
+            进度条对象
+        """
+        def ensure():
+            progress_bar = getattr(self, progress_var_name)
+            if not progress_bar:
+                progress_bar = self._create_progress_bar(parent_frame)
+                progress_bar.pack(fill=tk.X)
+                setattr(self, progress_var_name, progress_bar)
+            return progress_bar
+
+        # 在主线程中执行
+        result = [None]
+        def execute():
+            result[0] = ensure()
+        self._safe_update_ui(execute)
+        return result[0]
+
     def _create_progress_bar(self, parent):
         """创建进度条"""
         progress_frame = tk.Frame(parent, bg=GUI_COLORS['background'])
