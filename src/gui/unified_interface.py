@@ -9,12 +9,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import os
+import base64
 import time
 from datetime import datetime
 from typing import Optional
-
 import sys
-import os
+
 from Crypto.PublicKey import RSA
 
 # 确保src目录在Python路径中
@@ -43,7 +43,7 @@ class UnifiedInterface:
         
         # TLS/SSL选项（默认启用）
         self.use_tls = tk.BooleanVar(value=True)
-        self.network_utils = NetworkUtils(use_tls=self.use_tls.get())
+        self.network_utils = NetworkUtils(use_tls=self.use_tls.get(), allow_self_signed=True)
         self.crypto_utils = CryptoUtils()
         
         # 发送方相关

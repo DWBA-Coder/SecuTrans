@@ -20,10 +20,19 @@ import json
 import threading
 import time
 import logging
+import base64
+import ipaddress
 from typing import Callable, Optional, Dict, Any, Tuple
 from contextlib import contextmanager
 import os
 from pathlib import Path
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from datetime import datetime, timedelta
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -177,13 +186,6 @@ class NetworkUtils:
             bool: 生成是否成功
         """
         try:
-            from cryptography import x509
-            from cryptography.x509.oid import NameOID
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import rsa
-            from cryptography.hazmat.primitives import serialization
-            from datetime import datetime, timedelta
-            
             # 生成RSA私钥（2048位）
             logger.info("生成RSA私钥...")
             private_key = rsa.generate_private_key(
@@ -218,7 +220,7 @@ class NetworkUtils:
                 x509.SubjectAlternativeName([
                     x509.DNSName("localhost"),
                     x509.DNSName("127.0.0.1"),
-                    x509.IPAddress(socket.inet_aton("127.0.0.1")),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
                 ]),
                 critical=False,
             ).sign(private_key, hashes.SHA256())
@@ -816,8 +818,6 @@ class NetworkUtils:
             bool: 发送是否成功
         """
         try:
-            import base64
-            
             envelope_data = {
                 'type': 'digital_envelope',
                 'data': digital_envelope
@@ -857,8 +857,6 @@ class NetworkUtils:
             - 发送方公钥（如果有）
         """
         try:
-            import base64
-            
             logger.debug("开始接收数字信封...")
             received_data = self.receive_data(socket_obj, timeout)
             

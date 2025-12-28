@@ -1,6 +1,6 @@
 {
-    "private_key_path": "keys/SecuTrans_20251227_205830_private.pem",
-    "public_certificate_path": "F:/pycharm/SecuTrans/certificates/SecuTrans_20251227_205830_public.pem",
+    "private_key_path": "keys/SecuTrans_20251228_200842_private.pem",
+    "public_certificate_path": "F:/pycharm/SecuTrans/certificates/SecuTrans_20251228_200842_public.pem",
     "receive_directory": "files/",
     "server_port": "5375",
     "last_algorithm": "AES-128",
