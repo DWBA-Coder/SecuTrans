@@ -16,8 +16,19 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto import Random
 from typing import Dict, Tuple, Any
+# ========== 新增：补充日志和时间依赖 ==========
+import logging
+from datetime import datetime
 
-# 尝试导入新的加密算法
+# 配置日志（便于排查证书问题）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - SecuTrans - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("SecuTrans")
+
+# 原有尝试导入部分（保留）
 try:
     from Crypto.Cipher import ChaCha20
     CHACHA20_AVAILABLE = True
@@ -113,9 +124,12 @@ class CryptoUtils:
     
     @staticmethod
     def _encrypt_aes(data: bytes, mode: str, key: bytes, iv: bytes = None) -> Dict[str, Any]:
-        """AES加密"""
+        """AES加密（修复GCM填充+nonce长度）"""
         if iv is None:
-            iv = Random.get_random_bytes(16)
+            if mode == 'GCM':
+                iv = Random.get_random_bytes(12)  # GCM标准nonce长度12字节
+            else:
+                iv = Random.get_random_bytes(16)
         
         if mode == 'ECB':
             cipher = AES.new(key, AES.MODE_ECB)
@@ -127,7 +141,7 @@ class CryptoUtils:
             return {'ciphertext': base64.b64encode(ct).decode(), 'iv': base64.b64encode(iv).decode(), 'tag': None}
         elif mode == 'GCM':
             cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-            ct, tag = cipher.encrypt_and_digest(pad(data, AES.block_size))
+            ct, tag = cipher.encrypt_and_digest(data)  # GCM模式移除pad
             return {
                 'ciphertext': base64.b64encode(ct).decode(), 
                 'iv': base64.b64encode(iv).decode(), 
@@ -150,7 +164,7 @@ class CryptoUtils:
     
     @staticmethod
     def _decrypt_aes(encrypted_data: Dict[str, Any], mode: str, key: bytes) -> bytes:
-        """AES解密"""
+        """AES解密（修复GCM填充）"""
         ct = base64.b64decode(encrypted_data['ciphertext'])
         iv = base64.b64decode(encrypted_data['iv']) if encrypted_data['iv'] else None
         tag = base64.b64decode(encrypted_data['tag']) if encrypted_data['tag'] else None
@@ -166,7 +180,7 @@ class CryptoUtils:
         elif mode == 'GCM':
             cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
             pt = cipher.decrypt_and_verify(ct, tag)
-            return unpad(pt, AES.block_size)
+            return pt  # GCM模式移除unpad
         elif mode == 'CFB':
             cipher = AES.new(key, AES.MODE_CFB, iv)
             return cipher.decrypt(ct)
@@ -339,17 +353,32 @@ class CryptoUtils:
     
     @staticmethod
     def encrypt_with_rsa(data: bytes, public_key: bytes) -> bytes:
-        """使用RSA公钥加密"""
-        rsa_key = RSA.import_key(public_key)
-        cipher = PKCS1_OAEP.new(rsa_key)
-        return cipher.encrypt(data)
+        """使用RSA公钥加密（增加日志+长度校验）"""
+        try:
+            rsa_key = RSA.import_key(public_key)
+            max_len = rsa_key.size_in_bytes() - 42  # PKCS1_OAEP 填充占用42字节
+            if len(data) > max_len:
+                raise ValueError(f"RSA加密数据过长（最大{max_len}字节，当前{len(data)}字节）")
+            cipher = PKCS1_OAEP.new(rsa_key)
+            encrypted = cipher.encrypt(data)
+            logger.info(f"RSA加密成功，数据长度: {len(data)} → 加密后: {len(encrypted)}")
+            return encrypted
+        except Exception as e:
+            logger.error(f"RSA加密失败: {str(e)}")
+            raise
     
     @staticmethod
     def decrypt_with_rsa(encrypted_data: bytes, private_key: bytes) -> bytes:
-        """使用RSA私钥解密"""
-        rsa_key = RSA.import_key(private_key)
-        cipher = PKCS1_OAEP.new(rsa_key)
-        return cipher.decrypt(encrypted_data)
+        """使用RSA私钥解密（增加日志）"""
+        try:
+            rsa_key = RSA.import_key(private_key)
+            cipher = PKCS1_OAEP.new(rsa_key)
+            decrypted = cipher.decrypt(encrypted_data)
+            logger.info(f"RSA解密成功，加密数据长度: {len(encrypted_data)} → 解密后: {len(decrypted)}")
+            return decrypted
+        except Exception as e:
+            logger.error(f"RSA解密失败: {str(e)}（大概率是密钥不匹配或数据篡改）")
+            raise
     
     @staticmethod
     def create_digital_envelope(data: bytes, algorithm: str, mode: str, 
@@ -384,18 +413,23 @@ class CryptoUtils:
     @staticmethod
     def open_digital_envelope(digital_envelope: Dict[str, Any], 
                             receiver_private_key: bytes, sender_public_key: bytes) -> bytes:
-        """打开数字信封（新方案：验证数字签名）"""
+        """打开数字信封（精准错误提示）"""
         try:
             # 1. 用接收方私钥解密得到对称密钥
             encrypted_key = base64.b64decode(digital_envelope['encrypted_key'])
-            symmetric_key = CryptoUtils.decrypt_with_rsa(encrypted_key, receiver_private_key)
+            try:
+                symmetric_key = CryptoUtils.decrypt_with_rsa(encrypted_key, receiver_private_key)
+            except Exception as e:
+                raise Exception(f"【RSA解密失败】对称密钥解密失败（密钥不匹配/数据篡改）: {str(e)}")
             
             # 2. 用对称密钥解密得到消息M
             algorithm = digital_envelope['algorithm']
             mode = digital_envelope['mode']
             encrypted_data = digital_envelope['encrypted_data']
-            
-            decrypted_data = CryptoUtils.decrypt_data(encrypted_data, algorithm, mode, symmetric_key)
+            try:
+                decrypted_data = CryptoUtils.decrypt_data(encrypted_data, algorithm, mode, symmetric_key)
+            except Exception as e:
+                raise Exception(f"【对称加密解密失败】算法={algorithm}, 模式={mode}: {str(e)}")
             
             # 3. 用发送方公钥验证数字签名
             signature = base64.b64decode(digital_envelope['signature'])
@@ -405,13 +439,13 @@ class CryptoUtils:
             if not CryptoUtils.verify_digital_signature(
                 original_hash.encode(), signature, sender_public_key
             ):
-                raise Exception("数字签名验证失败！消息来源不可信。")
+                raise Exception("【签名验证失败】消息来源不可信（非证书/解密错误）")
             
             # 4. 比较哈希值
             hash_algorithm = digital_envelope['hash_algorithm']
             calculated_hash = CryptoUtils.calculate_hash(decrypted_data, hash_algorithm)
             if calculated_hash != original_hash:
-                raise Exception("数据完整性验证失败！文件可能被篡改。")
+                raise Exception("【哈希验证失败】数据被篡改（非证书/解密错误）")
             
             return decrypted_data
             
@@ -679,3 +713,168 @@ class CryptoUtils:
         """从文件加载密钥"""
         with open(key_path, 'rb') as f:
             return f.read()
+    
+    # ========== 新增：私钥保存方法（配套证书使用） ==========
+    @staticmethod
+    def save_private_key(private_key: bytes, save_path: str):
+        """保存私钥到文件（带目录自动创建）"""
+        # 校验路径并创建父目录
+        dir_path = os.path.dirname(save_path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path, mode=0o755, exist_ok=True)
+            logger.info(f"创建私钥目录: {dir_path}")
+        
+        # 写入私钥文件
+        with open(save_path, 'wb') as f:
+            f.write(private_key)
+        logger.info(f"私钥已保存到: {save_path}")
+
+    # ========== 新增：证书生成（确保写入文件） ==========
+    @staticmethod
+    def generate_certificate(public_key: bytes, info: dict, save_path: str) -> None:
+        """
+        生成并写入证书文件（落地到文件系统）
+        :param public_key: RSA公钥字节流
+        :param info: 证书信息（如{"name": "测试用户", "org": "测试公司"}）
+        :param save_path: 证书保存路径（如 "./certs/test.cert"）
+        """
+        try:
+            # 1. 创建证书父目录（解决路径不存在问题）
+            dir_path = os.path.dirname(save_path)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, mode=0o755, exist_ok=True)
+                logger.info(f"创建证书目录: {dir_path}")
+            
+            # 2. 构建证书内容
+            cert_data = {
+                "version": "1.0",
+                "issuer": info,
+                "public_key_b64": base64.b64encode(public_key).decode('utf-8'),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "algorithm": "RSA",
+                "hash_algorithm": "SHA-256"
+            }
+            
+            # 3. 写入证书文件（确保编码和格式正确）
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(cert_data, f, indent=4, ensure_ascii=False)
+            
+            # 4. 验证文件是否真的生成
+            if os.path.exists(save_path):
+                file_size = os.path.getsize(save_path)
+                if file_size > 0:
+                    logger.info(f"证书已成功写入: {save_path}（大小: {file_size} 字节）")
+                else:
+                    raise Exception(f"证书文件为空: {save_path}")
+            else:
+                raise Exception(f"证书文件未生成: {save_path}")
+        
+        except PermissionError:
+            raise Exception(f"权限不足！无法写入证书到 {save_path}，请检查目录权限")
+        except Exception as e:
+            logger.error(f"生成证书失败: {str(e)}")
+            raise
+
+    # ========== 新增：证书读取（确保能解析） ==========
+    @staticmethod
+    def load_certificate(cert_path: str) -> Tuple[bytes, dict]:
+        """
+        读取证书文件并解析公钥和信息
+        :param cert_path: 证书路径
+        :return: (RSA公钥字节流, 证书信息字典)
+        """
+        try:
+            # 1. 校验文件存在性
+            if not os.path.exists(cert_path):
+                raise FileNotFoundError(f"证书文件不存在: {cert_path}")
+            
+            # 2. 校验文件非空
+            file_size = os.path.getsize(cert_path)
+            if file_size == 0:
+                raise Exception(f"证书文件为空: {cert_path}")
+            
+            # 3. 读取并解析证书
+            with open(cert_path, 'r', encoding='utf-8') as f:
+                cert_data = json.load(f)
+            
+            # 4. 校验必选字段
+            required_fields = ["version", "issuer", "public_key_b64", "created_at", "algorithm"]
+            for field in required_fields:
+                if field not in cert_data:
+                    raise ValueError(f"证书缺少必选字段: {field}")
+            
+            # 5. 解码公钥
+            public_key_bytes = base64.b64decode(cert_data['public_key_b64'])
+            
+            logger.info(f"成功读取证书: {cert_path}（持有者: {cert_data['issuer'].get('name', '未知')}）")
+            return public_key_bytes, cert_data['issuer']
+        
+        except json.JSONDecodeError:
+            raise Exception(f"证书格式错误（非JSON）: {cert_path}，请检查文件内容是否为合法JSON")
+        except base64.binascii.Error:
+            raise Exception(f"证书中公钥base64解码失败: {cert_path}，公钥可能被篡改")
+        except Exception as e:
+            logger.error(f"读取证书失败: {str(e)}")
+            raise
+
+
+# ========== 测试代码（验证核心功能） ==========
+if __name__ == "__main__":
+    # 测试路径（可自定义）
+    test_priv_path = "./test_rsa_private.pem"
+    test_cert_path = "./certs/test_certificate.cert"
+    
+    try:
+        # 1. 生成RSA密钥对
+        priv_key, pub_key = CryptoUtils.generate_rsa_keypair()
+        logger.info(f"生成RSA公钥: {pub_key[:50]}...")
+        
+        # 2. 保存私钥
+        CryptoUtils.save_private_key(priv_key, test_priv_path)
+        
+        # 3. 生成证书（核心验证）
+        cert_info = {
+            "name": "SecuTrans测试用户",
+            "org": "测试公司",
+            "email": "test@secutrans.com"
+        }
+        CryptoUtils.generate_certificate(pub_key, cert_info, test_cert_path)
+        
+        # 4. 读取证书
+        loaded_pub, loaded_info = CryptoUtils.load_certificate(test_cert_path)
+        
+        # 5. 校验一致性
+        assert pub_key == loaded_pub, "读取的公钥与原公钥不一致！"
+        assert loaded_info['name'] == cert_info['name'], "证书信息读取错误！"
+        logger.info("✅ 证书写入/读取验证成功！")
+
+        # 6. 测试数字信封功能
+        # 生成对称密钥
+        sym_key = CryptoUtils.generate_symmetric_key("AES", 32)
+        # 测试数据
+        test_data = "测试数字信封功能".encode('utf-8')
+        # 发送方私钥（用于签名）、接收方公钥（用于加密对称密钥）
+        send_priv, send_pub = CryptoUtils.generate_rsa_keypair()
+        recv_priv, recv_pub = CryptoUtils.generate_rsa_keypair()
+        # 创建信封
+        envelope = CryptoUtils.create_digital_envelope(
+            data=test_data,
+            algorithm="AES",
+            mode="GCM",
+            symmetric_key=sym_key,
+            recipient_public_key=recv_pub,
+            sender_private_key=send_priv
+        )
+        # 打开信封
+        decrypted_data = CryptoUtils.open_digital_envelope(
+            digital_envelope=envelope,
+            receiver_private_key=recv_priv,
+            sender_public_key=send_pub
+        )
+        assert decrypted_data == test_data, "数字信封解密结果不一致！"
+        logger.info(f"✅ 数字信封功能验证成功，解密结果: {decrypted_data.decode('utf-8')}")
+    
+    except Exception as e:
+        logger.error(f"❌ 测试失败: {str(e)}")
+        raise
+    

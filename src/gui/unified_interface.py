@@ -28,6 +28,10 @@ from core.crypto_utils import CryptoUtils
 from core.network_utils import NetworkUtils
 from core.app_config import app_config
 from utils.logger import get_logger, log_operation
+from .selectors import FileSelector, AlgorithmSelector
+from .logging import LogViewer
+from .progress import ProgressBar
+from .buttons import StyledButton
 
 
 class UnifiedInterface:
@@ -39,7 +43,7 @@ class UnifiedInterface:
         
         # TLS/SSL选项（默认启用）
         self.use_tls = tk.BooleanVar(value=True)
-        self.network_utils = NetworkUtils(use_tls=self.use_tls.get(), allow_self_signed=True)
+        self.network_utils = NetworkUtils(use_tls=self.use_tls.get())
         self.crypto_utils = CryptoUtils()
         
         # 发送方相关
