@@ -3,8 +3,8 @@
     "public_certificate_path": "F:/pycharm/SecuTrans/certificates/SecuTrans_20251227_205830_public.pem",
     "receive_directory": "files/",
     "server_port": "5375",
-    "last_algorithm": "DES3",
-    "last_mode": "ECB",
+    "last_algorithm": "AES-128",
+    "last_mode": "GCM",
     "auto_generate_key_info": {
         "name": "SecuTrans",
         "email": "user@sectrans.com",

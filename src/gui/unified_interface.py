@@ -36,7 +36,10 @@ class UnifiedInterface:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.logger = get_logger()
-        self.network_utils = NetworkUtils()
+        
+        # TLS/SSL选项（默认启用）
+        self.use_tls = tk.BooleanVar(value=True)
+        self.network_utils = NetworkUtils(use_tls=self.use_tls.get())
         self.crypto_utils = CryptoUtils()
         
         # 发送方相关
@@ -426,6 +429,29 @@ class UnifiedInterface:
         tk.Label(ip_port_row, text="端口:", bg=GUI_COLORS['background']).pack(side=tk.LEFT)
         self.send_port_var = tk.StringVar(value="5375")
         tk.Entry(ip_port_row, textvariable=self.send_port_var, width=8).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # TLS/SSL安全传输选项
+        tls_row = tk.Frame(net_info_frame, bg=GUI_COLORS['background'])
+        tls_row.pack(fill=tk.X, pady=5)
+        
+        self.tls_checkbox = tk.Checkbutton(
+            tls_row,
+            text="启用 TLS/SSL 加密传输",
+            variable=self.use_tls,
+            command=self._on_tls_toggled,
+            bg=GUI_COLORS['background'],
+            font=('微软雅黑', 9)
+        )
+        self.tls_checkbox.pack(side=tk.LEFT)
+        
+        self.tls_status_label = tk.Label(
+            tls_row,
+            text="✓ 安全",
+            fg='green',
+            bg=GUI_COLORS['background'],
+            font=('微软雅黑', 9, 'bold')
+        )
+        self.tls_status_label.pack(side=tk.LEFT, padx=(5, 0))
 
         # 发送进度条
         self.send_progress_frame = tk.Frame(send_frame, bg=GUI_COLORS['background'])
@@ -731,34 +757,35 @@ class UnifiedInterface:
         """哈希算法选择改变时的处理"""
         self._update_hash_display()
     
-    def _update_crypto_display(self):
-        """更新加密显示"""
-        algorithm = self.algorithm_var.get()
+    def _on_tls_toggled(self):
+        """TLS/SSL开关切换时的处理"""
+        enabled = self.use_tls.get()
         
-        if algorithm in ENCRYPTION_ALGORITHMS:
-            # 更新模式列表
-            modes = ENCRYPTION_ALGORITHMS[algorithm]['modes']
-            self.mode_combo['values'] = modes  # 设置可用模式
-            
-            # 设置默认模式（如果当前模式不在列表中）
-            current_mode = self.mode_var.get()
-            if current_mode not in modes:
-                if modes:
-                    self.mode_var.set(modes[0])
-                    self.mode_combo.set(modes[0])
-                else:
-                    self.mode_var.set("")
-                    self.mode_combo.set("")
-            
-            # 更新算法安全状态
-            is_secure = ENCRYPTION_ALGORITHMS[algorithm].get('secure', True)
-            if is_secure:
-                self.algo_security_label.config(text="安全", fg='green')
-            else:
-                self.algo_security_label.config(text="不安全（仅作演示）", fg='red')
-            
-            # 更新模式安全状态
-            self._update_mode_security()
+        # 如果服务器正在运行，阻止切换并恢复原状态
+        if self.server_running:
+            self.add_log("请先停止服务器再切换TLS设置", "WARNING")
+            # 恢复复选框原状态（不触发回调）
+            self.use_tls.set(not enabled)
+            # 恢复标签状态
+            if not enabled:  # 恢复后的状态是启用（原本是启用）
+                self.tls_status_label.config(text="✓ 安全", fg='green')
+            else:  # 恢复后的状态是禁用（原本是禁用）
+                self.tls_status_label.config(text="", fg='black')
+            return
+        
+        # 服务器未运行，正常切换
+        if enabled:
+            # 打勾时显示"✓ 安全"
+            self.tls_status_label.config(text="✓ 安全", fg='green')
+            self.add_log("TLS/SSL加密传输已启用", "SUCCESS")
+        else:
+            # 不打勾时不显示任何内容
+            self.tls_status_label.config(text="", fg='black')
+            self.add_log("警告: TLS/SSL加密传输已禁用！网络通信不加密", "WARNING")
+        
+        # 重新初始化网络工具
+        self.network_utils = NetworkUtils(use_tls=enabled)
+        self.add_log(f"网络工具已更新 (TLS: {'启用' if enabled else '禁用'})", "INFO")
     
     def _initialize_crypto_settings(self):
         """初始化加密设置"""
